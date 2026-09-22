@@ -244,5 +244,32 @@ async def find_latest_report_url(page: Page, tag_url: str, timeout_ms: int = 300
     await page.goto(tag_url, wait_until="networkidle", timeout=timeout_ms)
 
     try:
-                await page.wait_for_selector("a[href]", timeout=timeout_ms)
+        await page.wait_for_selector("a[href]", timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        logger.warning("タグ一覧ページでリンクが見つかりませんでした: %s", tag_url)
+        return None
 
+    hrefs = await page.locator("a[href]").evaluate_all("els => els.map(e => e.href)")
+    report_url_re = re.compile(r"^https://min-repo\.com/\d+/?$")
+    for href in hrefs:
+        if report_url_re.match(href):
+            return href
+    return None
+
+
+async def new_page(headless: bool = True):
+    """Playwrightのブラウザ・コンテキスト・ページを生成するヘルパー。
+    呼び出し側で `async with` して使う。
+    """
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=headless)
+    context = await browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        viewport={"width": 390, "height": 844},
+        locale="ja-JP",
+    )
+    page = await context.new_page()
+    return playwright, browser, context, page
