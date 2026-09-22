@@ -244,4 +244,5 @@ async def find_latest_report_url(page: Page, tag_url: str, timeout_ms: int = 300
     await page.goto(tag_url, wait_until="networkidle", timeout=timeout_ms)
 
     try:
-        await page.wait_for_
+                await page.wait_for_selector("a[href]", timeout=timeout_ms)
+
