@@ -121,7 +121,9 @@ async def _find_prev_day_url(page: Page) -> Optional[str]:
             el = page.locator(sel).first
             if await el.count() == 0:
                 continue
-            href = await el.get_attribute("href")
+            # get_attribute だと相対URL("/12345/")のまま返ることがあるため、
+            # evaluate で .href プロパティ(ブラウザが絶対URLに解決した値)を使う
+            href = await el.evaluate("el => el.href")
             if href:
                 return href
             # ボタン形式でクリックが必要な場合はここでは扱わず、
