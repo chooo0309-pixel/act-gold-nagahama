@@ -1,4 +1,4 @@
- """
+"""
 診断用スクリプト2 (改良版): 個別レポートページ(1日分)を開いて、
 実際にどれだけの<table>があるか、それぞれの見出し・行数を調べる。
 
@@ -22,7 +22,6 @@ from .scraper import new_page
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("collector.debug_report")
 
-# 2026-09-20 のレポートページ(タグ一覧から取得した実際のURL)
 REPORT_URL = "https://min-repo.com/3363553/"
 
 
@@ -32,7 +31,6 @@ async def main() -> None:
         logger.info("=== Navigating to %s ===", REPORT_URL)
         response = await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=45000)
 
-        # レスポンスの状態を確認
         if response is not None:
             logger.info("=== HTTP status: %d ===", response.status)
             logger.info("=== response.url: %s ===", response.url)
@@ -49,7 +47,6 @@ async def main() -> None:
 
         await page.wait_for_timeout(3000)
 
-        # この時点でのHTML冒頭を確認(空白ページか、Cloudflare的な確認画面か等)
         try:
             html_snippet = await page.content()
             logger.info("=== HTML長さ: %d文字 ===", len(html_snippet))
@@ -57,14 +54,12 @@ async def main() -> None:
         except Exception as e:
             logger.info("=== page.content() でエラー: %r ===", e)
 
-        # スクリーンショットを撮って実際の見た目を保存(artifactとしてアップロードする)
         try:
             await page.screenshot(path="debug_report_screenshot.png", full_page=True)
             logger.info("=== スクリーンショット保存: debug_report_screenshot.png ===")
         except Exception as e:
             logger.info("=== スクリーンショット失敗: %r ===", e)
 
-        # ページ最下部までスクロールして遅延読み込みを誘発する
         prev_height = 0
         for i in range(15):
             height = await page.evaluate("document.body.scrollHeight")
@@ -76,7 +71,6 @@ async def main() -> None:
 
         logger.info("=== スクロール完了 ===")
 
-        # スクロール後にもう一度スクリーンショット
         try:
             await page.screenshot(path="debug_report_screenshot_after_scroll.png", full_page=True)
             logger.info("=== スクロール後スクリーンショット保存 ===")
