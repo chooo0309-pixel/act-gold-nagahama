@@ -1,20 +1,9 @@
 """
-ACT GOLD長浜 スロット台データ収集 — CLIエントリーポイント
+CLI エントリーポイント。
 
 使い方:
-    # 直近1日分を取得 (日次実行用)
     python -m collector.main daily
-
-    # 指定期間をバックフィル (前日リンクを辿って遡る)
-    python -m collector.main backfill --start 2026-07-22 --end 2026-09-21
-
-    # 特定の1ページから手動で開始したい場合
-    python -m collector.main backfill --start 2026-07-22 --end 2026-09-21 \
-        --start-url https://min-repo.com/3365529/
-
-環境変数:
-    SUPABASE_URL
-    SUPABASE_SERVICE_ROLE_KEY
+    python -m collector.main backfill --start 2026-07-22 --end 2026-09-21 [--start-url URL] [--force]
 """
 
 from __future__ import annotations
@@ -22,139 +11,142 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import sys
 from datetime import date, datetime, timedelta
 
-from .scraper import DayReport, find_latest_report_url, new_page, scrape_report_page
+from .scraper import (
+    find_latest_report_url,
+    new_page,
+    scrape_report_page,
+    _find_prev_day_url,
+)
 from .supabase_client import SupabaseClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("collector.main")
 
 TAG_URL = "https://min-repo.com/tag/act-gold%E9%95%B7%E6%B5%9C/"
-MAX_BACKFILL_DAYS = 120  # 前日リンクを辿る回数の安全上限 (無限ループ防止)
+MAX_BACKFILL_DAYS = 120
 
 
-def parse_date(s: str) -> date:
+def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-async def collect_one(page, url: str, sb: SupabaseClient, run_mode: str) -> DayReport:
-    """1ページ分を取得してSupabaseにupsertし、DayReportを返す(前日リンクの取得のため)。"""
+async def collect_one(page, report_url: str, client: SupabaseClient, run_mode: str) -> tuple[date | None, int]:
+    """1日分を収集してSupabaseに保存する。(報告日付, 保存行数) を返す。"""
     try:
-        report = await scrape_report_page(page, url)
+        report = await scrape_report_page(page, report_url)
     except Exception as e:
-        logger.exception("スクレイピング中にエラー: %s", url)
-        sb.log_collection(None, url, status="failed", error_message=str(e), run_mode=run_mode)
+        logger.error("収集失敗: %s (%r)", report_url, e)
+        client.log_collection(
+            report_date=None,
+            source_url=report_url,
+            status="failed",
+            rows_collected=0,
+            run_mode=run_mode,
+            error_message=str(e),
+        )
         raise
 
-    if report.report_date is None:
-        logger.error("日付を特定できませんでした: %s", url)
-        sb.log_collection(None, url, status="failed", error_message="date not found", run_mode=run_mode)
-        return report
-
     if not report.rows:
-        logger.warning("データ0件: %s (%s)", url, report.report_date)
-        sb.log_collection(report.report_date, url, status="no_data", run_mode=run_mode)
-        return report
+        logger.warning("データ0件: %s (%s)", report_url, report.report_date)
+        client.log_collection(
+            report_date=report.report_date.isoformat(),
+            source_url=report_url,
+            status="no_data",
+            rows_collected=0,
+            run_mode=run_mode,
+        )
+        return report.report_date, 0
 
-    n = sb.upsert_day_report(report)
-    sb.log_collection(report.report_date, url, status="success", rows_collected=n, run_mode=run_mode)
-    logger.info("保存完了: %s件 (%s)", n, report.report_date)
-    return report
+    saved = client.upsert_day_report(report)
+    client.log_collection(
+        report_date=report.report_date.isoformat(),
+        source_url=report_url,
+        status="success",
+        rows_collected=saved,
+        run_mode=run_mode,
+    )
+    logger.info("収集成功: %s -> %d行保存", report.report_date, saved)
+    return report.report_date, saved
 
 
-async def run_daily(sb: SupabaseClient) -> None:
+async def run_daily() -> None:
+    client = SupabaseClient()
     playwright, browser, context, page = await new_page(headless=True)
     try:
         latest_url = await find_latest_report_url(page, TAG_URL)
-        if latest_url is None:
-            logger.error("最新レポートのURLが見つかりませんでした。タグページの構造が変わった可能性があります。")
-            sys.exit(1)
-        await collect_one(page, latest_url, sb, run_mode="daily")
+        if not latest_url:
+            raise RuntimeError("最新レポートURLが見つかりませんでした")
+        await collect_one(page, latest_url, client, run_mode="daily")
     finally:
         await browser.close()
         await playwright.stop()
+        client.close()
 
 
-async def run_backfill(sb: SupabaseClient, start: date, end: date, start_url: str | None, force: bool) -> None:
+async def run_backfill(start: date, end: date, start_url: str | None, force: bool) -> None:
+    if (end - start).days > MAX_BACKFILL_DAYS:
+        raise RuntimeError(f"バックフィル期間が長すぎます(最大{MAX_BACKFILL_DAYS}日)")
+
+    client = SupabaseClient()
     playwright, browser, context, page = await new_page(headless=True)
+
     try:
-        current_url = start_url
-        if current_url is None:
+        collected_dates = set() if force else client.get_collected_dates(run_mode="backfill")
+
+        if start_url:
+            current_url = start_url
+        else:
             current_url = await find_latest_report_url(page, TAG_URL)
-            if current_url is None:
-                logger.error("開始URLを特定できませんでした。--start-url を指定してください。")
-                sys.exit(1)
+            if not current_url:
+                raise RuntimeError("開始URLが見つかりませんでした")
 
-        already_done = set() if force else sb.get_collected_dates(run_mode="backfill")
+        while current_url:
+            await page.goto(current_url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(1000)
+            prev_url = await _find_prev_day_url(page)
 
-        visited = 0
-        while current_url and visited < MAX_BACKFILL_DAYS:
-            visited += 1
-
-            report = await scrape_report_page(page, current_url)
-
-            if report.report_date is None:
-                logger.error("日付が特定できずバックフィルを継続できません: %s", current_url)
-                sb.log_collection(None, current_url, status="failed", error_message="date not found", run_mode="backfill")
-                break
-
-            if report.report_date > end:
-                logger.info("%s は対象期間より新しいためスキップして前日へ", report.report_date)
-                current_url = report.prev_day_url
+            try:
+                report_date, saved = await collect_one(page, current_url, client, run_mode="backfill")
+            except Exception:
+                current_url = prev_url
                 continue
 
-            if report.report_date < start:
-                logger.info("%s は対象期間より古いため終了します", report.report_date)
+            if report_date < start:
+                logger.info("開始日(%s)より前に到達したため終了します: %s", start, report_date)
                 break
+            if report_date > end:
+                logger.info("終了日(%s)より後のデータでした。スキップして続行: %s", end, report_date)
+                current_url = prev_url
+                continue
 
-            if report.report_date.isoformat() in already_done:
-                logger.info("%s は取得済みのためスキップ", report.report_date)
-            elif not report.rows:
-                logger.warning("データ0件: %s (%s)", current_url, report.report_date)
-                sb.log_collection(report.report_date, current_url, status="no_data", run_mode="backfill")
-            else:
-                n = sb.upsert_day_report(report)
-                sb.log_collection(report.report_date, current_url, status="success", rows_collected=n, run_mode="backfill")
-                logger.info("保存完了: %s件 (%s)", n, report.report_date)
-
-            if report.prev_day_url is None:
-                logger.warning("「前日」リンクが見つかりませんでした。%s でバックフィルが止まります。", report.report_date)
-                break
-
-            current_url = report.prev_day_url
-
-        if visited >= MAX_BACKFILL_DAYS:
-            logger.warning("安全上限(%d日)に達したため停止しました。", MAX_BACKFILL_DAYS)
+            current_url = prev_url
 
     finally:
         await browser.close()
         await playwright.stop()
+        client.close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ACT GOLD長浜 スロット台データ収集")
-    sub = parser.add_subparsers(dest="mode", required=True)
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("daily", help="最新1日分を取得")
+    sub.add_parser("daily")
 
-    bf = sub.add_parser("backfill", help="指定期間をバックフィル")
-    bf.add_argument("--start", type=parse_date, required=True, help="開始日 YYYY-MM-DD")
-    bf.add_argument("--end", type=parse_date, required=True, help="終了日 YYYY-MM-DD")
-    bf.add_argument("--start-url", type=str, default=None, help="遡り始める個別レポートのURL(省略時は最新から)")
-    bf.add_argument("--force", action="store_true", help="取得済みの日付も再取得する")
+    backfill_parser = sub.add_parser("backfill")
+    backfill_parser.add_argument("--start", required=True, type=_parse_date)
+    backfill_parser.add_argument("--end", required=True, type=_parse_date)
+    backfill_parser.add_argument("--start-url", default=None)
+    backfill_parser.add_argument("--force", action="store_true")
 
     args = parser.parse_args()
-    sb = SupabaseClient()
 
-    if args.mode == "daily":
-        asyncio.run(run_daily(sb))
-    elif args.mode == "backfill":
-        asyncio.run(run_backfill(sb, args.start, args.end, args.start_url, args.force))
+    if args.command == "daily":
+        asyncio.run(run_daily())
+    elif args.command == "backfill":
+        asyncio.run(run_backfill(args.start, args.end, args.start_url, args.force))
 
 
 if __name__ == "__main__":
