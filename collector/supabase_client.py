@@ -103,5 +103,10 @@ class SupabaseClient:
         resp.raise_for_status()
         return {row["report_date"] for row in resp.json() if row.get("report_date")}
 
+    def rebuild_machine_history(self) -> None:
+        """slot_daily_data全体からmachine_historyを再構築する(Supabase側のRPC関数を呼ぶ)。"""
+        resp = self.client.post(f"{self.base_url}/rpc/rebuild_machine_history", json={})
+        resp.raise_for_status()
+
     def close(self) -> None:
         self.client.close()
