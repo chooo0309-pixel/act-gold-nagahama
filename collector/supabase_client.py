@@ -1,77 +1,66 @@
 """
-Supabase (PostgREST) への書き込みを行う薄いクライアント。
-
-supabase-py を使わず httpx で直接REST APIを叩いている理由:
-  - upsert (on_conflict) の挙動を明示的に制御したいため
-  - 依存を最小限にし、GitHub Actions上でのインストールを軽くするため
-
-必要な環境変数:
-  SUPABASE_URL          例: https://xxxxx.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY   service_role キー (RLSを回避して書き込むため。
-                               anon キーではRLSにより書き込みがブロックされる)
+Supabase REST API (PostgREST) を叩くための薄いクライアント。
+service_role キーを使うため RLS はバイパスされる(書き込み専用の用途)。
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import asdict
-from typing import Iterable
 
 import httpx
 
-from .scraper import DayReport, MachineRow
+from .scraper import DayReport
 
 logger = logging.getLogger("collector.supabase_client")
 
 
 class SupabaseClient:
-    def __init__(self, url: str | None = None, service_role_key: str | None = None):
-        self.url = (url or os.environ["SUPABASE_URL"]).rstrip("/")
-        self.key = service_role_key or os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-        self._client = httpx.Client(
-            base_url=f"{self.url}/rest/v1",
+    def __init__(self) -> None:
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not key:
+            raise RuntimeError(
+                "環境変数 SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY が設定されていません"
+            )
+        self.base_url = url.rstrip("/") + "/rest/v1"
+        self.client = httpx.Client(
             headers={
-                "apikey": self.key,
-                "Authorization": f"Bearer {self.key}",
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=minimal",
             },
             timeout=30.0,
         )
 
     def upsert_day_report(self, report: DayReport) -> int:
-        """1日分のレポートをupsertする。挿入/更新した行数を返す。"""
-        if report.report_date is None:
-            raise ValueError(
-                f"report_date が特定できませんでした (source_url={report.source_url})。"
-                " ページから日付を抽出できていない可能性があります。"
+        """1日分のレポートをslot_daily_dataにupsertする。挿入/更新した行数を返す。"""
+        payload = []
+        for row in report.rows:
+            payload.append(
+                {
+                    "report_date": report.report_date.isoformat(),
+                    "machine_name": row.machine_name,
+                    "unit_number": row.unit_number,
+                    "diff_medals": row.diff_medals,
+                    "game_count": row.game_count,
+                    "payout_rate": row.payout_rate,
+                    "bb_count": row.bb_count,
+                    "rb_count": row.rb_count,
+                    "composite_denom": row.composite_denom,
+                    "bb_rate_denom": row.bb_rate_denom,
+                    "rb_rate_denom": row.rb_rate_denom,
+                    "source_url": report.source_url,
+                }
             )
 
-        payload = [
-            {
-                "report_date": report.report_date.isoformat(),
-                "machine_name": row.machine_name,
-                "unit_number": row.unit_number,
-                "diff_medals": row.diff_medals,
-                "game_count": row.game_count,
-                "payout_rate": row.payout_rate,
-                "bb_count": row.bb_count,
-                "rb_count": row.rb_count,
-                "composite_denom": row.composite_denom,
-                "bb_rate_denom": row.bb_rate_denom,
-                "rb_rate_denom": row.rb_rate_denom,
-                "source_url": report.source_url,
-            }
-            for row in report.rows
-        ]
-
         if not payload:
-            logger.warning("行データが0件のためupsertをスキップ: %s", report.source_url)
             return 0
 
-        resp = self._client.post(
-            "/slot_daily_data?on_conflict=report_date,machine_name,unit_number",
+        resp = self.client.post(
+            f"{self.base_url}/slot_daily_data",
+            params={"on_conflict": "report_date,machine_name,unit_number"},
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
             json=payload,
         )
         resp.raise_for_status()
@@ -79,37 +68,40 @@ class SupabaseClient:
 
     def log_collection(
         self,
-        report_date,
+        report_date: str | None,
         source_url: str | None,
         status: str,
-        rows_collected: int = 0,
+        rows_collected: int,
+        run_mode: str,
         error_message: str | None = None,
-        run_mode: str = "backfill",
     ) -> None:
         payload = {
-            "report_date": report_date.isoformat() if report_date else None,
+            "report_date": report_date,
             "source_url": source_url,
             "status": status,
             "rows_collected": rows_collected,
             "error_message": error_message,
             "run_mode": run_mode,
         }
-        resp = self._client.post(
-            "/collection_log?on_conflict=report_date,run_mode",
-            json=[payload],
+        resp = self.client.post(
+            f"{self.base_url}/collection_log",
+            params={"on_conflict": "report_date,run_mode"},
             headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=payload,
         )
         resp.raise_for_status()
 
     def get_collected_dates(self, run_mode: str = "backfill") -> set[str]:
-        """すでに success で記録済みの report_date 一覧を取得する(重複実行を避けるため)。"""
-        resp = self._client.get(
-            "/collection_log",
+        resp = self.client.get(
+            f"{self.base_url}/collection_log",
             params={
                 "select": "report_date",
-                "status": "eq.success",
                 "run_mode": f"eq.{run_mode}",
+                "status": "eq.success",
             },
         )
         resp.raise_for_status()
-        return {row["report_date"] for row in resp.json()}
+        return {row["report_date"] for row in resp.json() if row.get("report_date")}
+
+    def close(self) -> None:
+        self.client.close()
