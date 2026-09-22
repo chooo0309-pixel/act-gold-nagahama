@@ -136,7 +136,9 @@ async def _find_prev_day_url(page: Page) -> Optional[str]:
 async def scrape_report_page(page: Page, url: str, timeout_ms: int = 30000) -> DayReport:
     """指定したmin-repoの個別レポートURLからスロット台データ一覧を取得する。"""
     logger.info("Navigating to %s", url)
-    await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+    # networkidle は広告/解析タグが常時通信するサイトでは達成されずタイムアウトしやすいため、
+    # domcontentloaded まで待ち、あとは目的の要素(台番ヘッダ)の出現を個別に待つ。
+    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
     # データ一覧の表が描画されるまで待つ。サイト内に "台番" という文字が
     # 出現するテーブルヘッダがあるはずなので、それを待機条件にする。
@@ -243,7 +245,7 @@ async def find_latest_report_url(page: Page, tag_url: str, timeout_ms: int = 300
     本文中のリンクからそれらしいものを最初に見つかったものを返す。
     """
     logger.info("Navigating to tag page %s", tag_url)
-    await page.goto(tag_url, wait_until="networkidle", timeout=timeout_ms)
+    await page.goto(tag_url, wait_until="domcontentloaded", timeout=45000)
 
     try:
         await page.wait_for_selector("a[href]", timeout=timeout_ms)
