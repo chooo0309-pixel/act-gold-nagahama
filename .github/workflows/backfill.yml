@@ -1,0 +1,68 @@
+name: Backfill (ACT GOLD長浜)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "開始日 (YYYY-MM-DD)"
+        required: true
+        default: "2026-07-22"
+      end_date:
+        description: "終了日 (YYYY-MM-DD)"
+        required: true
+        default: "2026-09-21"
+      start_url:
+        description: "遡り始める個別レポートURL(空欄なら最新から自動取得)"
+        required: false
+        default: ""
+      force:
+        description: "取得済みの日付も再取得する"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: act-gold-nagahama-collect
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    # 62日分 x 1ページ数秒〜十数秒を想定。余裕を持って長めに設定。
+    # サイト側の応答が遅い/ブロックされる場合はここより先にタイムアウトする。
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run backfill
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ARGS="backfill --start ${{ inputs.start_date }} --end ${{ inputs.end_date }}"
+          if [ -n "${{ inputs.start_url }}" ]; then
+            ARGS="$ARGS --start-url ${{ inputs.start_url }}"
+          fi
+          if [ "${{ inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          python -m collector.main $ARGS
+
+      - name: Upload debug screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-debug-${{ github.run_id }}
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore
