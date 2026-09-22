@@ -21,3 +21,13 @@ jobs:
 
       - name: Run debug script
         run: python -m collector.debug_report
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-report-screenshots
+          path: |
+            debug_report_screenshot.png
+            debug_report_screenshot_after_scroll.png
+          if-no-files-found: ignore
