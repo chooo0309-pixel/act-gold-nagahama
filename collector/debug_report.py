@@ -1,15 +1,15 @@
 """
-診断用スクリプト2 (改良版): 個別レポートページ(1日分)を開いて、
-実際にどれだけの<table>があるか、それぞれの見出し・行数を調べる。
+診断用スクリプト3: 「全台データ一覧・差枚ランキング」ボタンの正体を調べる。
 
-前回の実行で「総<table>数: 0」「BODY TEXT 総文字数: 0」という
-異常な結果になったため、原因切り分けのために以下を追加でログ出力する:
-- page.goto() 後の実際のURL (リダイレクトされていないか)
-- ページタイトル
-- HTTPレスポンスのステータスコード
-- <body>のinnerHTML冒頭500文字 (真っ白なのか、何か別の内容が出ているのか)
-- スクリーンショットをartifactとして保存 (実際に何が表示されているか目視確認できるように)
-- 主要な要素(html, body, head)の存在確認
+前回のスクリーンショットで、このボタンが機種別/バラエティ/末尾別タブとは
+別の独立したリンクになっていることが判明した。個別台(台番ごと)の
+データ一覧はこのボタンの先にあると考えられる。
+
+このスクリプトでは:
+1. 該当リンクを探し、hrefやテキストをログ出力
+2. リンクなら実際にそのURLへ遷移してテーブル構造を調べる
+3. href が無く JS操作(onclick等)の場合はクリックしてみて、
+   遷移後のURLとテーブル構造を調べる
 """
 
 from __future__ import annotations
@@ -25,92 +25,59 @@ logger = logging.getLogger("collector.debug_report")
 REPORT_URL = "https://min-repo.com/3363553/"
 
 
+async def dump_tables(page, label: str) -> None:
+    tables = page.locator("table")
+    table_count = await tables.count()
+    logger.info("=== [%s] 総<table>数: %d ===", label, table_count)
+    for i in range(table_count):
+        table = tables.nth(i)
+        header_cells = table.locator("thead tr th, tr:first-child th, tr:first-child td")
+        header_texts = [t.strip() for t in await header_cells.all_inner_texts()]
+        row_count = await table.locator("tbody tr").count()
+        if row_count == 0:
+            row_count = max(0, await table.locator("tr").count() - 1)
+        logger.info("[%s] table[%d]: header=%s rows=%d", label, i, header_texts, row_count)
+
+
 async def main() -> None:
     playwright, browser, context, page = await new_page(headless=True)
     try:
         logger.info("=== Navigating to %s ===", REPORT_URL)
-        response = await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=45000)
+        await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(2000)
 
-        if response is not None:
-            logger.info("=== HTTP status: %d ===", response.status)
-            logger.info("=== response.url: %s ===", response.url)
-        else:
-            logger.info("=== response is None (ナビゲーションが応答を返さなかった) ===")
+        candidates = page.locator("a:has-text('全台データ一覧'), button:has-text('全台データ一覧')")
+        count = await candidates.count()
+        logger.info("=== '全台データ一覧'を含む要素数: %d ===", count)
 
-        logger.info("=== page.url (現在のURL): %s ===", page.url)
-
-        try:
-            title = await page.title()
-            logger.info("=== page title: %r ===", title)
-        except Exception as e:
-            logger.info("=== page.title() でエラー: %r ===", e)
-
-        await page.wait_for_timeout(3000)
-
-        try:
-            html_snippet = await page.content()
-            logger.info("=== HTML長さ: %d文字 ===", len(html_snippet))
-            logger.info("=== HTML冒頭800文字 ===\n%s", html_snippet[:800])
-        except Exception as e:
-            logger.info("=== page.content() でエラー: %r ===", e)
-
-        try:
-            await page.screenshot(path="debug_report_screenshot.png", full_page=True)
-            logger.info("=== スクリーンショット保存: debug_report_screenshot.png ===")
-        except Exception as e:
-            logger.info("=== スクリーンショット失敗: %r ===", e)
-
-        prev_height = 0
-        for i in range(15):
-            height = await page.evaluate("document.body.scrollHeight")
-            if height == prev_height:
-                break
-            prev_height = height
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(800)
-
-        logger.info("=== スクロール完了 ===")
-
-        try:
-            await page.screenshot(path="debug_report_screenshot_after_scroll.png", full_page=True)
-            logger.info("=== スクロール後スクリーンショット保存 ===")
-        except Exception as e:
-            logger.info("=== スクロール後スクリーンショット失敗: %r ===", e)
-
-        tables = page.locator("table")
-        table_count = await tables.count()
-        logger.info("=== 総<table>数: %d ===", table_count)
-
-        for i in range(table_count):
-            table = tables.nth(i)
-            header_cells = table.locator("thead tr th, tr:first-child th, tr:first-child td")
-            header_texts = [t.strip() for t in await header_cells.all_inner_texts()]
-            row_count = await table.locator("tbody tr").count()
-            if row_count == 0:
-                row_count = max(0, await table.locator("tr").count() - 1)
-
-            heading_text = ""
-            try:
-                heading = table.locator("xpath=preceding::*[self::h1 or self::h2 or self::h3 or self::div][1]")
-                if await heading.count() > 0:
-                    heading_text = (await heading.first.inner_text()).strip()[:50]
-            except Exception:
-                pass
-
+        for i in range(count):
+            el = candidates.nth(i)
+            tag = await el.evaluate("el => el.tagName")
+            text = (await el.inner_text()).strip()
+            href = await el.evaluate("el => el.getAttribute('href')")
+            resolved_href = await el.evaluate("el => el.href || null")
+            onclick = await el.evaluate("el => el.getAttribute('onclick')")
             logger.info(
-                "table[%d]: header=%s rows=%d heading='%s'",
-                i, header_texts, row_count, heading_text,
+                "候補[%d]: tag=%s text=%r href=%r resolved_href=%r onclick=%r",
+                i, tag, text, href, resolved_href, onclick,
             )
 
-        body_text = await page.inner_text("body")
-        logger.info("=== BODY TEXT 総文字数: %d ===", len(body_text))
-        if len(body_text) > 0:
-            logger.info("=== BODY TEXT 冒頭500文字 ===\n%s", body_text[:500])
+        if count == 0:
+            logger.info("=== リンクが見つからなかった。処理終了 ===")
+            return
 
-    finally:
-        await browser.close()
-        await playwright.stop()
+        target = candidates.first
+        resolved_href = await target.evaluate("el => el.href || null")
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        if resolved_href and resolved_href.startswith("http"):
+            logger.info("=== hrefへ直接遷移します: %s ===", resolved_href)
+            await page.goto(resolved_href, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2000)
+            logger.info("=== 遷移後 page.url: %s ===", page.url)
+            await dump_tables(page, "遷移後")
+        else:
+            logger.info("=== hrefが取得できないためクリックを試みます ===")
+            async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                await target.click()
+            logger.info("=== クリック後 page.url: %s ===", page.url)
+            await page.w
