@@ -1,15 +1,24 @@
 """
-みんレポ(min-repo.com)から ACT GOLD長浜 のスロット台データを取得するモジュール。
+ACT GOLD長浜のスロットデータをmin-repo.comから収集するスクレイパー。
 
-サイトはJavaScriptで描画されるため、requestsではなくPlaywright(ヘッドレスブラウザ)
-でレンダリング後のDOMを読む。テーブルの列見出し(台番・差枚・G数...)をキーに
-汎用的にパースするため、サイト側のCSSクラス名が変わってもある程度は耐える設計。
+min-repo.comはJavaScriptでレンダリングされるため、Playwrightの
+ヘッドレスブラウザを使用する。
 
-【重要】このコードは実際のサイトに対して一度も実行できていません(この開発環境は
-ネットワークアクセスができないため)。ユーザーが共有したスクリーンショットの構造を
-もとに書いていますが、実際にGitHub Actions上で動かして初めて検証できます。
-最初の数回の実行結果(特に失敗時のスクリーンショット/HTML)を共有してもらえれば、
-セレクタなどを調整します。
+これまでの調査で判明したこと:
+- 個別レポートページ(例: https://min-repo.com/3363553/)には、
+  台番ごとの個別データそのものは無く、「全台データ一覧・差枚ランキング」
+  というリンク(href: "?kishu=all")の先に個別台データ一覧がある。
+- そのURL(<report_url>?kishu=all)には、
+  header=['機種','台番','差枚','G数','出率'] の5列・約300行超のテーブルがある。
+  BB/RB/合成等の列は含まれていない(スキーマ上NULL許容なのでそのまま欠損として扱う)。
+- そのURLへ直接アクセスすると、site側のBot対策/レート制限と思われる理由で
+  「テーブル0件・本文0文字」が返ってくることがある(頻度は不定、再試行すると
+  成功することが多い)。そのため必ずリトライ処理を挟む。
+- page.goto(..., wait_until="networkidle") はこのサイトでは高確率でタイムアウトする
+  (広告等が継続的に通信するため)。wait_until="domcontentloaded" + 明示的なtimeoutを使う。
+- 前日/翌日リンクのhrefは相対URLで書かれていることがあるため、
+  get_attribute("href") ではなく evaluate("el => el.href") で
+  ブラウザ解決後の絶対URLを取得する。
 """
 
 from __future__ import annotations
@@ -18,14 +27,18 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Optional
 
-from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 logger = logging.getLogger("collector.scraper")
 
-# 列見出しの日本語 → 内部フィールド名
+NAV_TIMEOUT_MS = 45000
+RETRY_COUNT = 4
+RETRY_DELAY_MS = 6000
+
+# 個別台データ表のヘッダー -> 内部フィールド名
 COLUMN_MAP = {
+    "機種": "machine_name",
     "台番": "unit_number",
     "差枚": "diff_medals",
     "G数": "game_count",
@@ -37,243 +50,263 @@ COLUMN_MAP = {
     "RB率": "rb_rate_denom",
 }
 
-# "1/109" のような分数表記から分母だけを取り出す
-_FRACTION_RE = re.compile(r"1\s*/\s*([\d,]+)")
-# ページ内のどこかにある日付表記 (例: 2026年7月22日, 2026/07/22, 07-22 等) を拾う
-_DATE_PATTERNS = [
-    re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日"),
-    re.compile(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})"),
-]
-
 
 @dataclass
 class MachineRow:
     machine_name: str
     unit_number: int
-    diff_medals: Optional[int] = None
-    game_count: Optional[int] = None
-    payout_rate: Optional[float] = None
-    bb_count: Optional[int] = None
-    rb_count: Optional[int] = None
-    composite_denom: Optional[int] = None
-    bb_rate_denom: Optional[int] = None
-    rb_rate_denom: Optional[int] = None
+    diff_medals: int | None = None
+    game_count: int | None = None
+    payout_rate: float | None = None
+    bb_count: int | None = None
+    rb_count: int | None = None
+    composite_denom: int | None = None
+    bb_rate_denom: int | None = None
+    rb_rate_denom: int | None = None
 
 
 @dataclass
 class DayReport:
-    report_date: Optional[date]
+    report_date: date
     source_url: str
     rows: list[MachineRow] = field(default_factory=list)
-    prev_day_url: Optional[str] = None  # 「前日 >>」ボタンのリンク先
 
 
-def _parse_int(text: str) -> Optional[int]:
-    text = text.strip().replace(",", "")
-    if text in ("", "-", "ー", "―"):
+def _parse_int(text: str) -> int | None:
+    if text is None:
         return None
-    try:
-        # マイナス値 (△1,234 や -1,234) にも対応
-        text = text.replace("△", "-")
-        return int(text)
-    except ValueError:
+    t = text.strip().replace(",", "")
+    if t in ("", "-", "--", "―", "N/A"):
         return None
-
-
-def _parse_float(text: str) -> Optional[float]:
-    text = text.strip().replace("%", "").replace(",", "")
-    if text in ("", "-", "ー", "―"):
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def _parse_fraction_denom(text: str) -> Optional[int]:
-    m = _FRACTION_RE.search(text)
+    m = re.match(r"^[+\-]?\d+$", t)
     if not m:
         return None
-    return _parse_int(m.group(1))
+    return int(t)
 
 
-def _extract_date_from_text(text: str) -> Optional[date]:
-    for pattern in _DATE_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            y, mo, d = (int(x) for x in m.groups())
-            try:
-                return date(y, mo, d)
-            except ValueError:
-                continue
-    return None
-
-
-async def _find_prev_day_url(page: Page) -> Optional[str]:
-    """「前日 >>」ボタンのhrefを探す。複数の言い回し・実装に備えて緩めに探索する。"""
-    candidates = [
-        "text=前日",
-        "a:has-text('前日')",
-        "button:has-text('前日')",
-    ]
-    for sel in candidates:
-        try:
-            el = page.locator(sel).first
-            if await el.count() == 0:
-                continue
-            # get_attribute だと相対URL("/12345/")のまま返ることがあるため、
-            # evaluate で .href プロパティ(ブラウザが絶対URLに解決した値)を使う
-            href = await el.evaluate("el => el.href")
-            if href:
-                return href
-            # ボタン形式でクリックが必要な場合はここでは扱わず、
-            # main.py 側でクリック遷移するフォールバックに任せる。
-        except Exception:
-            continue
-    return None
-
-
-async def scrape_report_page(page: Page, url: str, timeout_ms: int = 30000) -> DayReport:
-    """指定したmin-repoの個別レポートURLからスロット台データ一覧を取得する。"""
-    logger.info("Navigating to %s", url)
-    # networkidle は広告/解析タグが常時通信するサイトでは達成されずタイムアウトしやすいため、
-    # domcontentloaded まで待ち、あとは目的の要素(台番ヘッダ)の出現を個別に待つ。
-    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-
-    # データ一覧の表が描画されるまで待つ。サイト内に "台番" という文字が
-    # 出現するテーブルヘッダがあるはずなので、それを待機条件にする。
+def _parse_float(text: str) -> float | None:
+    if text is None:
+        return None
+    t = text.strip().replace(",", "").replace("%", "")
+    if t in ("", "-", "--", "―", "N/A"):
+        return None
     try:
-        await page.wait_for_selector("text=台番", timeout=timeout_ms)
-    except PlaywrightTimeoutError:
-        logger.warning("「台番」ヘッダが見つかりませんでした: %s（データなし、または構造変更の可能性）", url)
-
-    page_text = await page.inner_text("body")
-    report_date = _extract_date_from_text(page_text)
-
-    rows: list[MachineRow] = []
-
-    tables = page.locator("table")
-    table_count = await tables.count()
-    logger.info("Found %d <table> elements on %s", table_count, url)
-
-    for i in range(table_count):
-        table = tables.nth(i)
-        header_cells = table.locator("thead tr th, tr:first-child th, tr:first-child td")
-        header_texts = [t.strip() for t in await header_cells.all_inner_texts()]
-
-        if "台番" not in header_texts or "差枚" not in header_texts:
-            continue  # データ一覧の表ではない(グラフの凡例テーブルなど)
-
-        col_index = {}
-        for idx, h in enumerate(header_texts):
-            field_name = COLUMN_MAP.get(h)
-            if field_name:
-                col_index[field_name] = idx
-
-        # このテーブルの機種名を推定: テーブル直前にある見出し要素のテキストから
-        # "◯◯　データ一覧" のパターンを拾う
-        machine_name = await _guess_machine_name(table)
-
-        body_rows = table.locator("tbody tr")
-        if await body_rows.count() == 0:
-            body_rows = table.locator("tr").nth_range(1, None)  # ヘッダを除く全行 (フォールバック)
-
-        row_count = await body_rows.count()
-        for r in range(row_count):
-            tr = body_rows.nth(r)
-            cells = [c.strip() for c in await tr.locator("td").all_inner_texts()]
-            if not cells or len(cells) < 2:
-                continue
-
-            def cell(field_name: str) -> Optional[str]:
-                idx = col_index.get(field_name)
-                if idx is None or idx >= len(cells):
-                    return None
-                return cells[idx]
-
-            unit_raw = cell("unit_number")
-            if unit_raw is None or unit_raw in ("平均", "合計", ""):
-                continue  # 「平均」行はサマリなのでスキップ
-
-            unit_number = _parse_int(unit_raw)
-            if unit_number is None:
-                continue
-
-            rows.append(
-                MachineRow(
-                    machine_name=machine_name,
-                    unit_number=unit_number,
-                    diff_medals=_parse_int(cell("diff_medals") or ""),
-                    game_count=_parse_int(cell("game_count") or ""),
-                    payout_rate=_parse_float(cell("payout_rate") or ""),
-                    bb_count=_parse_int(cell("bb_count") or ""),
-                    rb_count=_parse_int(cell("rb_count") or ""),
-                    composite_denom=_parse_fraction_denom(cell("composite_denom") or ""),
-                    bb_rate_denom=_parse_fraction_denom(cell("bb_rate_denom") or ""),
-                    rb_rate_denom=_parse_fraction_denom(cell("rb_rate_denom") or ""),
-                )
-            )
-
-    prev_day_url = await _find_prev_day_url(page)
-
-    return DayReport(report_date=report_date, source_url=url, rows=rows, prev_day_url=prev_day_url)
-
-
-async def _guess_machine_name(table) -> str:
-    """テーブル要素の直前にある見出しテキストから機種名を推定する。
-    見出しの文言は「◯◯　データ一覧」の形式を想定 (画面例より)。
-    見つからない場合は "unknown" を返す。
-    """
-    try:
-        heading = table.locator(
-            "xpath=preceding::*[contains(text(), 'データ一覧')][1]"
-        )
-        if await heading.count() > 0:
-            text = (await heading.first.inner_text()).strip()
-            return re.sub(r"\s*データ一覧\s*$", "", text).strip() or "unknown"
-    except Exception:
-        pass
-    return "unknown"
-
-
-async def find_latest_report_url(page: Page, tag_url: str, timeout_ms: int = 30000) -> Optional[str]:
-    """ホールのタグ一覧ページ(例: /tag/act-gold長浜/)から、
-    最新レポートへのリンクを1件取得する。
-
-    一覧ページは新しい順に並んでいる前提。個別レポートのURLは
-    "https://min-repo.com/<数字>/" の形式であることを利用し、
-    本文中のリンクからそれらしいものを最初に見つかったものを返す。
-    """
-    logger.info("Navigating to tag page %s", tag_url)
-    await page.goto(tag_url, wait_until="domcontentloaded", timeout=45000)
-
-    try:
-        await page.wait_for_selector("a[href]", timeout=timeout_ms)
-    except PlaywrightTimeoutError:
-        logger.warning("タグ一覧ページでリンクが見つかりませんでした: %s", tag_url)
+        return float(t)
+    except ValueError:
         return None
 
-    hrefs = await page.locator("a[href]").evaluate_all("els => els.map(e => e.href)")
-    report_url_re = re.compile(r"^https://min-repo\.com/\d+/?$")
-    for href in hrefs:
-        if report_url_re.match(href):
-            return href
+
+def _parse_fraction_denom(text: str) -> int | None:
+    """'89/304' のような分数表記から分母(または分子)を int で取り出す補助関数。
+    現状の個別台一覧の列には使わないが、将来 BB/RB 率が出てきた場合のために残す。"""
+    if text is None:
+        return None
+    t = text.strip()
+    m = re.match(r"^(\d+)\s*/\s*(\d+)$", t)
+    if not m:
+        return _parse_int(t)
+    return int(m.group(2))
+
+
+def _extract_date_from_text(text: str) -> date | None:
+    """'2026年9月21日' や '9/20(日)' のような表記から date を抽出する。"""
+    if not text:
+        return None
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
     return None
 
 
 async def new_page(headless: bool = True):
-    """Playwrightのブラウザ・コンテキスト・ページを生成するヘルパー。
-    呼び出し側で `async with` して使う。
-    """
+    """Playwrightのbrowser/context/pageをiPhone風UAで初期化する。"""
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(headless=headless)
     context = await browser.new_context(
         user_agent=(
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.5 Mobile/15E148 Safari/604.1"
         ),
         viewport={"width": 390, "height": 844},
         locale="ja-JP",
     )
     page = await context.new_page()
     return playwright, browser, context, page
+
+
+async def _find_all_units_link(page) -> str | None:
+    """「全台データ一覧・差枚ランキング」リンクのhrefを解決済み絶対URLで返す。"""
+    candidates = page.locator(
+        "a:has-text('全台データ一覧'), button:has-text('全台データ一覧')"
+    )
+    count = await candidates.count()
+    if count == 0:
+        return None
+    href = await candidates.first.evaluate("el => el.href || null")
+    return href
+
+
+async def _dump_unit_table(page) -> list[MachineRow] | None:
+    """ページ内の<table>から、台番ごとの個別データ表を見つけてパースする。
+    対象テーブルは header に '台番' を含み、行数が最大のものとする。"""
+    tables = page.locator("table")
+    table_count = await tables.count()
+    if table_count == 0:
+        return None
+
+    target = None
+    max_rows = -1
+    for i in range(table_count):
+        table = tables.nth(i)
+        header_cells = table.locator("tr:first-child th, tr:first-child td")
+        header_texts = [t.strip() for t in await header_cells.all_inner_texts()]
+        if "台番" not in header_texts:
+            continue
+        row_count = max(0, await table.locator("tr").count() - 1)
+        if row_count > max_rows:
+            max_rows = row_count
+            target = table
+            target_headers = header_texts
+
+    if target is None:
+        return None
+
+    field_order = [COLUMN_MAP.get(h) for h in target_headers]
+
+    rows_locator = target.locator("tr")
+    total_rows = await rows_locator.count()
+    results: list[MachineRow] = []
+
+    for i in range(1, total_rows):  # 0行目はヘッダーなのでスキップ
+        cells = rows_locator.nth(i).locator("td, th")
+        texts = [t.strip() for t in await cells.all_inner_texts()]
+        if len(texts) != len(field_order):
+            continue
+
+        values: dict[str, str] = {}
+        for field_name, text in zip(field_order, texts):
+            if field_name:
+                values[field_name] = text
+
+        unit_number = _parse_int(values.get("unit_number", ""))
+        machine_name = values.get("machine_name", "").strip()
+        if unit_number is None or not machine_name:
+            # 台番または機種名が読み取れない行は捨てる(ヘッダー再掲や広告行などの可能性)
+            continue
+
+        row = MachineRow(
+            machine_name=machine_name,
+            unit_number=unit_number,
+            diff_medals=_parse_int(values.get("diff_medals", "")),
+            game_count=_parse_int(values.get("game_count", "")),
+            payout_rate=_parse_float(values.get("payout_rate", "")),
+            bb_count=_parse_int(values.get("bb_count", "")) if "bb_count" in values else None,
+            rb_count=_parse_int(values.get("rb_count", "")) if "rb_count" in values else None,
+            composite_denom=_parse_fraction_denom(values.get("composite_denom", "")) if "composite_denom" in values else None,
+            bb_rate_denom=_parse_fraction_denom(values.get("bb_rate_denom", "")) if "bb_rate_denom" in values else None,
+            rb_rate_denom=_parse_fraction_denom(values.get("rb_rate_denom", "")) if "rb_rate_denom" in values else None,
+        )
+        results.append(row)
+
+    return results
+
+
+async def scrape_report_page(page, report_url: str) -> DayReport:
+    """1日分のレポートページから、台番ごとの個別データを収集する。
+
+    手順:
+    1. レポートページ本体に遷移(日付抽出・前日リンク取得のため)
+    2. 「全台データ一覧・差枚ランキング」リンクのURLを取得
+    3. そのURLへ、レポートページをrefererとして遷移
+    4. site側の一時的なブロックに備えて、台番テーブルが見つかるまでリトライ
+    """
+    logger.info("レポートページへ遷移: %s", report_url)
+    await page.goto(report_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    await page.wait_for_timeout(1500)
+
+    body_text = await page.inner_text("body")
+    report_date = _extract_date_from_text(body_text) or _extract_date_from_text(await page.title())
+
+    all_units_url = await _find_all_units_link(page)
+    if all_units_url is None:
+        raise RuntimeError(f"「全台データ一覧」リンクが見つかりません: {report_url}")
+
+    rows: list[MachineRow] | None = None
+    last_error: Exception | None = None
+
+    for attempt in range(1, RETRY_COUNT + 1):
+        try:
+            logger.info(
+                "全台データ一覧へ遷移 (試行 %d/%d): %s", attempt, RETRY_COUNT, all_units_url
+            )
+            await page.goto(
+                all_units_url,
+                wait_until="domcontentloaded",
+                timeout=NAV_TIMEOUT_MS,
+                referer=report_url,
+            )
+            await page.wait_for_timeout(2000)
+
+            rows = await _dump_unit_table(page)
+            if rows:
+                logger.info("台番データ取得成功: %d行 (試行 %d)", len(rows), attempt)
+                break
+            else:
+                logger.warning(
+                    "台番データが0件でした(サイト側の一時的な制限の可能性)。リトライします。 (試行 %d/%d)",
+                    attempt, RETRY_COUNT,
+                )
+        except Exception as e:
+            last_error = e
+            logger.warning("全台データ一覧の取得中にエラー (試行 %d/%d): %r", attempt, RETRY_COUNT, e)
+
+        if attempt < RETRY_COUNT:
+            await page.wait_for_timeout(RETRY_DELAY_MS)
+            # レポートページに戻ってからもう一度リンクを踏み直す(refererを正しく保つため)
+            await page.goto(report_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            await page.wait_for_timeout(1500)
+
+    if not rows:
+        detail = f" (最後のエラー: {last_error!r})" if last_error else ""
+        raise RuntimeError(
+            f"{RETRY_COUNT}回試行しましたが台番データを取得できませんでした: {report_url}{detail}"
+        )
+
+    if report_date is None:
+        raise RuntimeError(f"レポートページから日付を抽出できませんでした: {report_url}")
+
+    return DayReport(report_date=report_date, source_url=report_url, rows=rows)
+
+
+async def _find_prev_day_url(page) -> str | None:
+    """「前日」リンクの絶対URLを返す。相対hrefのままだとナビゲーションに失敗するため、
+    evaluate()でブラウザ解決済みの絶対URLを取得する。"""
+    candidates = page.locator("a:has-text('前日')")
+    count = await candidates.count()
+    if count == 0:
+        return None
+    href = await candidates.first.evaluate("el => el.href || null")
+    return href
+
+
+async def find_latest_report_url(page, tag_url: str) -> str | None:
+    """タグ一覧ページから最新のレポートURLを1件取得する。"""
+    logger.info("タグ一覧ページへ遷移: %s", tag_url)
+    await page.goto(tag_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    await page.wait_for_timeout(1500)
+
+    links = page.locator("a[href^='https://min-repo.com/']")
+    count = await links.count()
+    pattern = re.compile(r"^https://min-repo\.com/\d+/?$")
+
+    for i in range(count):
+        href = await links.nth(i).evaluate("el => el.href || null")
+        if href and pattern.match(href):
+            return href
+
+    return None
