@@ -20,6 +20,9 @@ min-repo.comはJavaScriptでレンダリングされるため、Playwrightの
 - 前日リンクのhrefは相対URLで書かれていることがあるため、
   get_attribute("href") ではなく evaluate("el => el.href") で
   ブラウザ解決後の絶対URLを取得する。
+- ページ本文中の「YYYY年M月D日」表記は実プレー日ではなく更新日であり、
+  実プレー日の翌日になっているケースがある。実プレー日は
+  タイトルの「M/D(曜日)」表記から取得する(_extract_report_date参照)。
 - 同じURLに短時間で連続アクセスすると失敗しやすくなる可能性があるため、
   呼び出し側(main.py)は同一ページへの再ナビゲーションを避けること。
 """
@@ -110,6 +113,10 @@ def _parse_fraction_denom(text: str) -> int | None:
 
 
 def _extract_date_from_text(text: str) -> date | None:
+    """フォールバック用: 'YYYY年M月D日' 形式の日付を抽出する。
+    注意: ページ本文中のこの表記は「実プレー日」ではなく「更新日」の
+    ことがあり、実プレー日の翌日になっているケースが確認されている。
+    可能な限り _extract_report_date() を使うこと。"""
     if not text:
         return None
     m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
@@ -120,6 +127,41 @@ def _extract_date_from_text(text: str) -> date | None:
         except ValueError:
             return None
     return None
+
+
+def _extract_report_date(title: str, body_text: str) -> date | None:
+    """実際のプレー日を抽出する。
+
+    タイトル(例: '9/20(日) act gold長浜 | ...')の 'M/D(曜日)' 表記が
+    実プレー日そのものだが年が含まれていないため、本文中の
+    'YYYY年M月D日'(更新日、プレー日の翌日であることが多い)から
+    年だけを借用して組み立てる。タイトルから月日が取れない場合は
+    本文の日付にそのままフォールバックする。
+    """
+    body_date = _extract_date_from_text(body_text)
+    year = body_date.year if body_date else None
+
+    m = re.search(r"(\d{1,2})/(\d{1,2})\s*\(", title or "")
+    if m and year:
+        mo, d = int(m.group(1)), int(m.group(2))
+        try:
+            candidate = date(year, mo, d)
+        except ValueError:
+            candidate = None
+        if candidate:
+            if body_date and (body_date - candidate).days > 300:
+                try:
+                    candidate = date(year - 1, mo, d)
+                except ValueError:
+                    pass
+            elif body_date and (candidate - body_date).days > 300:
+                try:
+                    candidate = date(year + 1, mo, d)
+                except ValueError:
+                    pass
+            return candidate
+
+    return body_date
 
 
 async def new_page(headless: bool = True):
@@ -253,7 +295,8 @@ async def scrape_report_page(page, report_url: str) -> DayReport:
 
     async def check_report_page(p) -> bool:
         body_text = await p.inner_text("body")
-        date_holder["date"] = _extract_date_from_text(body_text) or _extract_date_from_text(await p.title())
+        title = await p.title()
+        date_holder["date"] = _extract_report_date(title, body_text)
         all_units_url_holder["url"] = await _find_all_units_link(p)
         prev_day_url_holder["url"] = await _find_prev_day_url(p)
         return all_units_url_holder["url"] is not None and date_holder["date"] is not None
