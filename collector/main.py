@@ -11,14 +11,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
-from .scraper import (
-    find_latest_report_url,
-    new_page,
-    scrape_report_page,
-    _find_prev_day_url,
-)
+from .scraper import find_latest_report_url, new_page, scrape_report_page
 from .supabase_client import SupabaseClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -32,8 +27,8 @@ def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-async def collect_one(page, report_url: str, client: SupabaseClient, run_mode: str) -> tuple[date | None, int]:
-    """1日分を収集してSupabaseに保存する。(報告日付, 保存行数) を返す。"""
+async def collect_one(page, report_url: str, client: SupabaseClient, run_mode: str):
+    """1日分を収集してSupabaseに保存する。DayReport (prev_day_url含む) を返す。"""
     try:
         report = await scrape_report_page(page, report_url)
     except Exception as e:
@@ -57,7 +52,7 @@ async def collect_one(page, report_url: str, client: SupabaseClient, run_mode: s
             rows_collected=0,
             run_mode=run_mode,
         )
-        return report.report_date, 0
+        return report
 
     saved = client.upsert_day_report(report)
     client.log_collection(
@@ -68,7 +63,7 @@ async def collect_one(page, report_url: str, client: SupabaseClient, run_mode: s
         run_mode=run_mode,
     )
     logger.info("収集成功: %s -> %d行保存", report.report_date, saved)
-    return report.report_date, saved
+    return report
 
 
 async def run_daily() -> None:
@@ -103,25 +98,21 @@ async def run_backfill(start: date, end: date, start_url: str | None, force: boo
                 raise RuntimeError("開始URLが見つかりませんでした")
 
         while current_url:
-            await page.goto(current_url, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1000)
-            prev_url = await _find_prev_day_url(page)
-
             try:
-                report_date, saved = await collect_one(page, current_url, client, run_mode="backfill")
+                report = await collect_one(page, current_url, client, run_mode="backfill")
             except Exception:
-                current_url = prev_url
-                continue
-
-            if report_date < start:
-                logger.info("開始日(%s)より前に到達したため終了します: %s", start, report_date)
+                logger.error("このURLで打ち切ります(前日リンクが取得できないため): %s", current_url)
                 break
-            if report_date > end:
-                logger.info("終了日(%s)より後のデータでした。スキップして続行: %s", end, report_date)
-                current_url = prev_url
+
+            if report.report_date < start:
+                logger.info("開始日(%s)より前に到達したため終了します: %s", start, report.report_date)
+                break
+            if report.report_date > end:
+                logger.info("終了日(%s)より後のデータでした。スキップして続行: %s", end, report.report_date)
+                current_url = report.prev_day_url
                 continue
 
-            current_url = prev_url
+            current_url = report.prev_day_url
 
     finally:
         await browser.close()
