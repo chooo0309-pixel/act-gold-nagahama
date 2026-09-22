@@ -20,4 +20,9 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run debug script
-        run: python -m collector.debug_tag
+        run: |
+          ls -la collector
+          for f in collector/debug*tag.py; do
+            if [ "$f" != "collector/debug_tag.py" ]; then mv "$f" collector/debug_tag.py; fi
+          done
+          python -m collector.debug_tag
