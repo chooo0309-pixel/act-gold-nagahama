@@ -1,0 +1,45 @@
+name: Daily Collect (ACT GOLD長浜)
+
+on:
+  schedule:
+    # 毎日 23:50 JST = 14:50 UTC (閉店後、当日データが確定してから取得)
+    - cron: "50 14 * * *"
+  workflow_dispatch: {}
+
+# 同時に複数走らないようにする(前回の実行が終わる前に次が走ると
+# Supabaseへの書き込みが競合したりブラウザ起動が重複する可能性があるため)
+concurrency:
+  group: act-gold-nagahama-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run daily collector
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -m collector.main daily
+
+      - name: Upload debug screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-debug-${{ github.run_id }}
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore
