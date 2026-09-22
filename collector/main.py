@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("collector.main")
 
 TAG_URL = "https://min-repo.com/tag/act-gold%E9%95%B7%E6%B5%9C/"
-MAX_BACKFILL_DAYS = 120
+MAX_BACKFILL_DAYS = 200
 
 
 def _parse_date(s: str) -> date:
@@ -77,6 +77,14 @@ async def run_daily() -> None:
     finally:
         await browser.close()
         await playwright.stop()
+
+    try:
+        logger.info("machine_historyを再構築します")
+        client.rebuild_machine_history()
+        logger.info("machine_history再構築完了")
+    except Exception as e:
+        logger.error("machine_history再構築に失敗しました: %r", e)
+    finally:
         client.close()
 
 
@@ -117,6 +125,14 @@ async def run_backfill(start: date, end: date, start_url: str | None, force: boo
     finally:
         await browser.close()
         await playwright.stop()
+
+    try:
+        logger.info("machine_historyを再構築します")
+        client.rebuild_machine_history()
+        logger.info("machine_history再構築完了")
+    except Exception as e:
+        logger.error("machine_history再構築に失敗しました: %r", e)
+    finally:
         client.close()
 
 
