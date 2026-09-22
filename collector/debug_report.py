@@ -80,4 +80,28 @@ async def main() -> None:
             async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
                 await target.click()
             logger.info("=== クリック後 page.url: %s ===", page.url)
-            await page.w
+            await page.wait_for_timeout(2000)
+            await dump_tables(page, "クリック後")
+
+        try:
+            await page.screenshot(path="debug_report_screenshot.png", full_page=True)
+            logger.info("=== スクリーンショット保存 ===")
+        except Exception as e:
+            logger.info("=== スクリーンショット失敗: %r ===", e)
+
+        body_text = await page.inner_text("body")
+        logger.info("=== BODY TEXT 総文字数: %d ===", len(body_text))
+
+    except Exception as e:
+        logger.info("=== エラー発生: %r ===", e)
+        try:
+            await page.screenshot(path="debug_report_screenshot.png", full_page=True)
+        except Exception:
+            pass
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
